@@ -29,7 +29,7 @@ _ALLOWED_FIX_PATHS = {
 
 
 class FaultMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
     message_id: str = Field(min_length=1, description="Identifier for the fault message.")
     alert_code: str | None = Field(
@@ -57,10 +57,14 @@ class FaultMessage(BaseModel):
 
 
 class UrgencyDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
-    urgency: UrgencyLevel = Field(description="Urgency assigned by the triage rules.")
-    fix_path: FixPath = Field(description="Recommended service path for this decision.")
+    urgency: UrgencyLevel = Field(
+        strict=False, description="Urgency assigned by the triage rules."
+    )
+    fix_path: FixPath = Field(
+        strict=False, description="Recommended service path for this decision."
+    )
     reason: str = Field(min_length=1, description="Explanation of the evidence used.")
     matched_alert_code: str | None = Field(
         default=None,
@@ -74,6 +78,14 @@ class UrgencyDecision(BaseModel):
         default=False,
         description="Whether a reviewer must assess an unclear safety concern.",
     )
+
+    @field_validator("urgency", "fix_path", mode="before")
+    @classmethod
+    def require_enum_text(cls, value: object) -> str:
+        # Serialized enum strings are valid inputs alongside enum members.
+        if not isinstance(value, str):
+            raise ValueError("Expected an enum member or its string value.")
+        return value
 
     @model_validator(mode="after")
     def validate_fix_path(self) -> "UrgencyDecision":
