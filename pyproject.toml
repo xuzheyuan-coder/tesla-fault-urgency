@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tesla-fault-urgency"
 version = "0.1.0"
-description = "Deterministic fault-message triage for a Zero service simulation"
+description = "Rule-based and AI-assisted fault-message triage for a Zero service simulation"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2,<3"]
+dependencies = ["pydantic>=2,<3", "python-dotenv>=1,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]

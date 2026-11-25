@@ -143,12 +143,16 @@ def _reports(pattern: re.Pattern[str], clauses: Iterable[str]) -> bool:
     )
 
 
+def _message_clauses(message_text: str) -> list[str]:
+    normalized = message_text.casefold().replace("\u2019", "'")
+    return [" ".join(clause.split()) for clause in _CLAUSE_BREAK.split(normalized)]
+
+
 def assess_message_text(
     message_text: str, *, wiper_alert: bool
 ) -> tuple[list[str], list[str]]:
     """Return confirmed symptom matches and any remaining signals for review."""
-    normalized = message_text.casefold().replace("\u2019", "'")
-    clauses = [" ".join(clause.split()) for clause in _CLAUSE_BREAK.split(normalized)]
+    clauses = _message_clauses(message_text)
     braking_clauses = [clause for clause in clauses if _BRAKING_CONTEXT.search(clause)]
 
     symptoms = [name for name, pattern in _DIRECT_SYMPTOMS if _reports(pattern, clauses)]

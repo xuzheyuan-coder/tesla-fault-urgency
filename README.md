@@ -4,6 +4,10 @@ A local Python classifier for the Zero Tesla service simulation. A validated
 `FaultMessage` produces an `UrgencyDecision` with separate urgency and fix-path
 fields, a reason, and the evidence behind the decision.
 
+The project supports local rule-based classification, OpenRouter assessments
+of sanitized fault observations, and resumable CSV batches. All modes use
+the same Pydantic v2 decision model.
+
 The simulated service team receives fault reports in arrival order. A serious
 brake or steering issue can be buried among routine service requests. The
 classifier identifies reports that need immediate attention and recommends a
@@ -75,8 +79,13 @@ that the fix path is compatible with the urgency.
 `models.py` defines and validates the input and output. `classifier.py` applies
 the alert-code and routing rules through `classify_fault_message()`.
 `symptoms.py` matches English symptom and review signals with context checks
-for wording such as negated symptoms. The `tests/` directory covers both the
-models and classifier.
+for wording such as negated symptoms. `ai_classifier.py` builds sanitized
+observations, validates the model's urgency and review flag, and assigns the
+existing fix paths. `openrouter.py` handles HTTPS, free routing, and API errors.
+`batch.py` reuses the classifier and records each message and API attempt in
+SQLite. `batch_reports.py` exports decisions, review queues, and usage summaries.
+The `tests/` directory covers the rule engine, schema, API integration, and
+batch recovery.
 
 ## Install and test
 
@@ -90,8 +99,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 ~~~
 
-On macOS or Linux, use `.venv/bin/python` for the last two commands. The tests
-use short example messages and run independently of the Zero CSV.
+On macOS or Linux, use `.venv/bin/python` for the last two commands. Tests use
+example messages and also exercise the 300-record Zero batch when the local
+CSV is available. OpenRouter tests mock the network client, so the suite
+runs without an API key and uses zero live requests.
 
 ## Classify a message
 
@@ -114,7 +125,160 @@ print(decision.model_dump_json(indent=2))
 This report receives `safety_urgent` and `stop_driving_and_tow`. The decision
 identifies the sinking brake pedal as evidence.
 
-## Verification results
+## Classify a message with OpenRouter
+
+### Configure a local API key
+
+Copy `.env.example` to `.env` in the project root. Open `.env` in a local text
+editor and set `OPENROUTER_API_KEY` to your OpenRouter key. Git ignores `.env`
+and local variants. The versioned template contains an empty value.
+
+### Make one live test request
+
+Run this command from the project root after saving your key.
+
+~~~powershell
+.\.venv\Scripts\python.exe -m fault_urgency --smoke-test
+~~~
+
+This sends one synthetic touchscreen report. Standard output contains the
+decision, and standard error carries the assessment status and safe metadata
+such as the selected model, finish reasons, and completion and reasoning token
+counts. The smoke test also confirms when OpenRouter reported zero cost.
+
+| Smoke test status | Exit code | Meaning |
+| --- | ---: | --- |
+| `classified` | 0 | The model returned a valid structured decision, which may itself require human review. |
+| `incomplete_output` or `invalid_output` | 2 | The request was free, but the model failed to produce a usable decision. The result goes to human review, and `issue` identifies the cause. |
+| `request_error` | 1 | The request could not be completed or verified, for example because of rate limits, regional restrictions, or an unavailable free model. |
+
+The client requests `max_completion_tokens=2048` to leave room for both
+reasoning and the JSON decision. The diagnostic line contains metadata only.
+On macOS or Linux, use `.venv/bin/python` as the interpreter.
+
+To classify a single local record, supply a JSON file with the `FaultMessage`
+fields described above.
+
+~~~powershell
+.\.venv\Scripts\python.exe -m fault_urgency --input path\to\message.json
+~~~
+
+Python callers can use `classify_with_openrouter(message)` for the same
+workflow or `assess_with_openrouter(message)` to receive the decision, status,
+and diagnostics together.
+
+### Safety, privacy, and cost controls
+
+- Confirmed local safety decisions return immediately. The model can flag a
+  new safety risk or request human review, and a locally required review stays
+  in effect. The local route remains authoritative for routine cases.
+- The request contains fixed symptom labels extracted locally, any recognized
+  alert code, and whether local rules require review. Raw descriptions, names,
+  email addresses, vehicle identifiers, message IDs, and customer urgency
+  ratings stay local.
+- Sparse reports, truncated responses, and model output that fails Pydantic
+  validation produce `soon` with `human_review_required=true`. The English
+  symptom vocabulary can omit unusual or unfamiliar phrasing.
+- The client uses only `openrouter/free` with zero price limits for input,
+  output, and per-request pricing. It requests JSON Schema support and
+  verifies the free model and zero cost in the response. The single-message
+  commands make at most one request and surface service errors directly.
+
+OpenRouter documents the [free router](https://openrouter.ai/docs/guides/routing/routers/free-router),
+[provider price limits](https://openrouter.ai/docs/guides/routing/provider-selection),
+and [structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs).
+
+## Process a CSV batch
+
+Use a UTF-8 CSV with `message_id` and `message_text`. Supply the vehicle
+alert as `vehicle_alert_code` or `alert_code` and customer urgency as
+`customer_reported_urgency` when available. The whole file is validated
+before execution. Use unique, de-identified message IDs with no surrounding
+whitespace. The batch preserves these IDs exactly.
+
+CSV mode defaults to a dry run. The preview shows the number of initial
+requests and any saved progress. It uses zero API credentials and zero
+network requests.
+
+~~~powershell
+.\.venv\Scripts\python.exe -m fault_urgency --csv "path\to\faults.csv"
+~~~
+
+Live execution requires both `--execute` and a positive `--max-requests`.
+For example, this command permits at most five HTTP attempts after the local
+key is configured.
+
+~~~powershell
+.\.venv\Scripts\python.exe -m fault_urgency --csv "path\to\faults.csv" --execute --max-requests 5
+~~~
+
+A fresh 300-row file plans 300 individual chat completion requests. Each
+request contains the original message ID, any recognized alert code, fixed
+symptom labels, and local safety and review flags. Raw descriptions, names,
+email addresses, and vehicle identifiers stay local. Every row gets an
+initial request, including confirmed local safety cases, sparse reports, and
+reports with identical observations.
+
+The model returns an explicit value for every `UrgencyDecision` field.
+Pydantic validates the response, including enums, a nonblank reason, and
+the permitted urgency and fix-path combinations. For a valid response, the
+exports show both the model decision and the final decision after local
+safety and review rules. For an unusable response, the classification
+fields are blank. The failure and any confirmed local safety flag are
+available for review. Malformed JSON, missing fields, and invalid enums
+have separate issue codes.
+
+### Request budget and recovery
+
+The default SQLite file is `dist/fault-batch-per-message.sqlite3`. Pass
+`--checkpoint` to select another local `.sqlite3` file. Resume with the same
+CSV and checkpoint. SQLite stores one item per message and one audit entry
+per attempt. The batch skips previously completed items and reserves each
+new attempt before network I/O. If an interruption leaves a request
+unconfirmed, its record is flagged for review and stays out of automatic
+replay.
+
+Each run uses one worker and spaces request starts at least six seconds
+apart for a shared checkpoint. The budget counts every attempt, including
+one allowed retry for a transient request failure. Invalid model output
+goes to review after its first response. Rate limits and free-model
+unavailability pause the run. A later explicit execution can retry within
+the same two-attempt limit after the recorded cooldown and once quota is
+available. The cooldown uses `Retry-After` when provided and otherwise waits
+at least 60 seconds. A cost check failure pauses immediately.
+
+The batch uses `openrouter/free`, zero price limits, and a zero-cost response
+check. The free tier typically allows 50 requests per day, so a fresh
+300-record batch can span at least six quota windows. Confirm the account's
+remaining free quota before choosing a live budget.
+[OpenRouter pricing and limits](https://openrouter.ai/pricing)
+
+### Reports
+
+The batch writes reports next to the checkpoint in a `.reports` directory,
+under a subdirectory for the CSV snapshot. Each execution refreshes the
+reports from saved state, including pending rows if the budget is exhausted.
+
+| File | Contents |
+| --- | --- |
+| `results.csv` | One row per original message ID in input order, with status, classification, local safety flag, and the model decision when available. |
+| `validation_failures.csv` | Incomplete or invalid responses with their issue codes. |
+| `human_review.csv` | Records requiring review, including invalid output, terminal request failures, and unconfirmed attempts. |
+| `attempts.csv` | One row per attempt with the message ID, HTTP and model status, model name, token usage, reported cost, and any error. Unreported values are blank. |
+| `summary.json` | Progress, counts by status and urgency, validation issues, and totals for reported token usage and cost. |
+
+Source CSV files, SQLite checkpoints, and generated reports are Git-ignored.
+
+### Batch verification
+
+Mock tests confirmed 300 individual requests and 300 Pydantic validations
+for the original Zero CSV. The output matched every original message ID in
+order, including all 105 local safety cases. A completed replay made zero
+requests. Tests also cover resuming a partial batch, interruptions,
+validation failure reports, attempt limits, free-model errors, and zero-cost
+enforcement. All 176 pytest tests passed.
+
+## Phase-one verification results
 
 All **86 pytest tests passed** on Windows with Python 3.15.0, Pydantic 2.14.4,
 and pytest 9.2.0. The suite covers all six safety codes, hidden safety symptoms,
@@ -157,7 +321,7 @@ for both models. The same input now raises a `ValidationError` with type
 decision accepts valid enum strings for JSON round trips. The change surfaces
 malformed records at the model boundary before they enter the workflow.
 
-## Original implementation prompt
+## Original phase-one implementation prompt
 
 The following is the original English development request from the project
 conversation.

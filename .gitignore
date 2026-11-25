@@ -8,7 +8,11 @@ dist/
 
 # Local data and credentials
 *.csv
+*.sqlite3
+*.sqlite3-*
+*.reports/
 .env
 .env.*
+!/.env.example
 *.pem
 *.key
